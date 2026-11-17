@@ -2,6 +2,54 @@
 import streamlit as st
 import xml.etree.ElementTree as ET
 from io import StringIO
+import unicodedata
+
+
+# XML 欄位別名集中設定：未來只需在對應欄位的 tuple 加入名稱，不必修改處理邏輯。
+# 格式："程式內部欄位名稱": ("XML 標籤名稱1", "XML 標籤名稱2", ...)
+XML_FIELD_ALIASES = {
+    "account_id": (
+        "科目編號",
+        "科目-編號",
+        # 若日後出現其他格式，例如 "科目代號"，直接在此新增即可。
+    ),
+}
+
+
+def _normalize_xml_tag(tag):
+    """對 XML 標籤做有限度的正規化（全形文字、常見連字號差異）。"""
+    # 兼容保留命名空間的 Element；process_xml 亦會先移除命名空間。
+    local_name = tag.rsplit("}", 1)[-1]
+    normalized = unicodedata.normalize("NFKC", local_name).strip()
+    for dash in ("‐", "‑", "‒", "–", "—", "−", "﹣"):
+        normalized = normalized.replace(dash, "-")
+    return normalized.casefold()
+
+
+def find_field_element(row, field_key):
+    """依別名順序查找 ROW 內的欄位；優先選取有內容的元素。
+
+    即使主要別名的標籤存在但內容為空，也會嘗試其他別名。
+    若所有同名欄位都為空，則回傳第一個找到的元素。
+    """
+    aliases = XML_FIELD_ALIASES[field_key]
+    children = list(row)
+    normalized_children = [(_normalize_xml_tag(child.tag), child) for child in children]
+
+    for alias in aliases:
+        normalized_alias = _normalize_xml_tag(alias)
+        for child_name, child in normalized_children:
+            if child_name == normalized_alias and (child.text or "").strip():
+                return child
+
+    for alias in aliases:
+        normalized_alias = _normalize_xml_tag(alias)
+        for child_name, child in normalized_children:
+            if child_name == normalized_alias:
+                return child
+
+    return None
+
 
 def process_xml(xml_string, enable_delete, enable_value_process):
     """
@@ -30,7 +78,7 @@ def process_xml(xml_string, enable_delete, enable_value_process):
         for row in dataset.findall('ROW'):
             # --- 功能 A：刪除指定範圍 ---
             if enable_delete:
-                account_id_el = row.find('科目編號')
+                account_id_el = find_field_element(row, "account_id")
                 if account_id_el is not None and account_id_el.text:
                     try:
                         account_id = int(account_id_el.text)
@@ -113,6 +161,7 @@ config_col1, config_col2 = st.columns(2)
 with config_col1:
     do_delete = st.toggle("啟用「科目範圍刪除」", value=True, help="刪除科目編號 1902xx 與 2801xx")
     st.caption("自動過濾不必要的科目編號")
+    st.caption("可辨識欄位：" + "、".join(XML_FIELD_ALIASES["account_id"]))
 
 with config_col2:
     do_value_adj = st.toggle("啟用「數值符號調整」", value=True, help="處理負數決算數及反轉增減金額")
