@@ -150,62 +150,130 @@ def process_xml(xml_string, enable_delete, enable_value_process):
 
 # --- Streamlit 介面渲染 ---
 
-st.set_page_config(page_title="XML 自動化工具", layout="centered")
+def render_xml_tab():
+    st.subheader('XML 科目處理')
+    st.caption('保留原專案：科目編號範圍刪除、正負數處理及 SEQNO 重排。')
+    left, right = st.columns(2)
+    with left:
+        do_delete = st.toggle('啟用「科目範圍刪除」', value=True,
+                              help='科目編號 190201–190299 及 280101–280199')
+        st.caption('可辨識欄位：' + '、'.join(XML_FIELD_ALIASES['account_id']))
+    with right:
+        do_value_adj = st.toggle('啟用「數值符號調整」', value=True)
+        st.caption('負數決算數轉正，以及比較增減金額的條件式反轉。')
+    uploaded_file = st.file_uploader('選擇 XML 檔案', type=['xml'], key='xml_input')
+    if uploaded_file is None:
+        return
+    if st.button('開始 XML 處理', use_container_width=True, key='run_xml'):
+        try:
+            modified_xml, removed_count = process_xml(uploaded_file.getvalue().decode('utf-8-sig'),
+                                                      do_delete, do_value_adj)
+        except UnicodeDecodeError:
+            st.error('XML 檔案文字編碼錯誤，請使用 UTF-8。')
+            return
+        if modified_xml:
+            st.session_state['xml_result'] = (modified_xml, removed_count, uploaded_file.name)
+    result = st.session_state.get('xml_result')
+    if result and result[2] == uploaded_file.name:
+        modified_xml, removed_count, original_name = result
+        st.success(f'完成處理，刪除 {removed_count} 筆 XML ROW。')
+        st.download_button('下載處理後的 XML', modified_xml,
+                           file_name=f'processed_{original_name}',
+                           mime='application/xml', use_container_width=True)
+        with st.expander('預覽 XML（前 2,000 字）'):
+            st.code(modified_xml[:2000], language='xml')
 
-st.title('🚀 XML 檔案處理工具')
 
-# 在畫面中間建立設定區域
-st.markdown("### 🛠️ 處理設定")
-config_col1, config_col2 = st.columns(2)
+def render_excel_tab():
+    st.subheader('Excel 資產負債表｜公開上網版轉換')
+    st.info('移除「遞延資產」及「負債準備」的明細子科目，保留父科目、彙總金額及來源列印縮放設定。')
+    st.caption('公開輸出只含轉換後的單一工作表，不會帶出原始工作表、參考工作表或刪除明細。')
+    upload = st.file_uploader('選擇 Excel 原始檔（.xlsx）', type=['xlsx'], key='xlsx_input')
+    if upload is None:
+        return
+    from io import BytesIO
+    from openpyxl import load_workbook
+    import hashlib
+    import os
+    from excel_public_converter import convert_excel_public
+    raw = upload.getvalue()
+    try:
+        probe = load_workbook(BytesIO(raw), read_only=True, data_only=False)
+        sheet_names = probe.sheetnames
+        probe.close()
+    except Exception as exc:
+        st.error(f'Excel 無法讀取：{exc}')
+        return
+    source_name = st.selectbox('原始版工作表', sheet_names, index=0, key='xlsx_source')
+    ref_options = ['（不使用參考工作表）'] + [n for n in sheet_names if n != source_name]
+    suggested = next((i for i, n in enumerate(ref_options) if '公開' in n), 0)
+    reference_name = st.selectbox('參考公開版（選填，逐格比對）',
+                                  ref_options, index=suggested, key='xlsx_ref')
+    ref = reference_name if reference_name != ref_options[0] else None
+    opt_a, opt_b = st.columns(2)
+    with opt_a:
+        keep_layout = st.checkbox('保留原始分頁', value=True, key='xlsx_layout',
+                                  help='依桌面版 Excel 的原始分頁，將刪除列的高度平均分給同頁保留的科目列。')
+    with opt_b:
+        fill_zero = st.checkbox('將數字欄空白補為 0', value=False, key='xlsx_zero')
+    fingerprint = hashlib.sha256(raw + repr((source_name, ref, keep_layout, fill_zero)).encode('utf-8')).hexdigest()
+    result = st.session_state.get('excel_result')
+    if result and result[0] != fingerprint:
+        st.session_state.pop('excel_result')
+        result = None
+    if st.button('產生 Excel 公開上網版', type='primary', use_container_width=True, key='run_xlsx'):
+        try:
+            public_bytes, report = convert_excel_public(raw, source_sheet=source_name,
+                                reference_sheet=ref, fill_zero=fill_zero,
+                                preserve_layout=keep_layout)
+        except Exception as exc:
+            st.error(f'轉換已停止：{exc}')
+        else:
+            st.session_state['excel_result'] = (fingerprint, public_bytes, report)
+            result = st.session_state['excel_result']
+    if result:
+        _, public_bytes, report = result
+        st.success('公開版已完成。原始檔不會被覆蓋。')
+        c1, c2, c3 = st.columns(3)
+        c1.metric('刪除子科目', f'{len(report.removed)} 筆')
+        c2.metric('補入 0 值', f'{report.filled_zero_count} 格')
+        c3.metric('對照版逐格差異', '未提供' if report.reference_mismatch_count is None
+                  else str(report.reference_mismatch_count))
+        if report.adjusted_print_pages:
+            st.caption(f'已有 {report.adjusted_print_pages} 頁由同頁的科目列平均分攤刪除列的高度。')
+        if report.applied_reference_heights:
+            st.caption('參考版逐格一致，已套用其列高。')
+        if report.drawing_preserved:
+            st.caption('已保留頁首文字方塊（例如「單位：新臺幣元」）。')
+        if report.footer_notes_preserved:
+            st.caption('已保留頁尾附註圖片。')
+        for warning in report.warning_messages:
+            st.warning(warning)
+        if report.reference_mismatches:
+            with st.expander('內容差異（前 30 筆）'):
+                for issue in report.reference_mismatches:
+                    st.write(issue)
+        with st.expander('本次刪除科目（僅畫面顯示，不會寫進公開檔）'):
+            st.table([{'父科目': item['parent'], '原始列': item['original_row'],
+                       '子科目': item['label']} for item in report.removed])
+        base_name = os.path.splitext(upload.name)[0]
+        st.download_button('下載 Excel 公開上網版（僅公開內容）', public_bytes,
+                           file_name=f'{base_name}_公開上網版.xlsx',
+                           mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                           use_container_width=True)
 
-with config_col1:
-    do_delete = st.toggle("啟用「科目範圍刪除」", value=True, help="刪除科目編號 1902xx 與 2801xx")
-    st.caption("自動過濾不必要的科目編號")
-    st.caption("可辨識欄位：" + "、".join(XML_FIELD_ALIASES["account_id"]))
 
-with config_col2:
-    do_value_adj = st.toggle("啟用「數值符號調整」", value=True, help="處理負數決算數及反轉增減金額")
-    st.caption("負數轉正及增減金額反轉邏輯")
+def main():
+    st.set_page_config(page_title='XML / Excel 自動化工具', layout='wide')
+    st.title('XML / Excel 自動化工具')
+    xml_tab, xlsx_tab = st.tabs(['XML 科目處理', 'Excel 公開版轉換'])
+    with xml_tab:
+        render_xml_tab()
+    with xlsx_tab:
+        render_excel_tab()
+    st.divider()
+    st.caption('Excel 資產負債表公開版應在正式上網前，以 Excel 列印預覽確認頁末科目。')
 
-st.divider() # 加入分隔線
 
-# 上傳區域
-uploaded_file = st.file_uploader("📂 請選擇要處理的 XML 檔案", type=['xml'])
-
-if uploaded_file is not None:
-    xml_content = uploaded_file.getvalue().decode('utf-8')
-    
-    # 執行按鈕
-    if st.button('✨ 開始自動化處理', use_container_width=True):
-        if not do_delete and not do_value_adj:
-            st.warning("⚠️ 目前未開啟任何功能，僅會進行 SEQNO 序號重整。")
-        
-        with st.spinner('正在分析數據並轉換格式...'):
-            modified_xml, removed_count = process_xml(xml_content, do_delete, do_value_adj)
-            
-            if modified_xml:
-                st.success(f"✅ 處理完成！")
-                
-                # 統計數據顯示
-                res_col1, res_col2 = st.columns(2)
-                res_col1.metric("刪除行數", f"{removed_count} 筆")
-                res_col2.metric("處理狀態", "成功")
-
-                st.download_button(
-                    label="💾 下載處理後的 XML 檔案",
-                    data=modified_xml,
-                    file_name=f"processed_{uploaded_file.name}",
-                    mime="application/xml",
-                    use_container_width=True
-                )
-                
-                with st.expander("🔍 預覽修改後的代碼 (前 2000 字)"):
-                    st.code(modified_xml[:2000], language='xml')
-
-# 頁尾說明
-st.markdown("""
----
-<p style='text-align: center; color: gray;'>
-    💡 提示：修改設定後不需重新上傳，直接點擊「開始自動化處理」即可。
-</p>
-""", unsafe_allow_html=True)
+if __name__ == '__main__':
+    main()
